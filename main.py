@@ -28,9 +28,11 @@ last_db_mtime = 0
 db_path = os.path.join(os.path.dirname(__file__), 'config.db')
 
 def init_db():
-    """Инициализирует базу данных и создаёт таблицу cfg_discord"""
+    """Инициализирует базу данных и создаёт таблицы cfg_discord и discord_data"""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
+    
+    # Таблица для настроек
     cursor.execute('''CREATE TABLE IF NOT EXISTS cfg_discord (
                         key TEXT,
                         value TEXT,
@@ -44,9 +46,9 @@ def init_db():
                         channel_type TEXT,
                         category_id INTEGER,
                         category_name TEXT,
-                        visible_to_roles TEXT)''')
-
-
+                        visible_to_roles TEXT,
+                        vtr_human TEXT)''')
+    
     conn.commit()
     conn.close()
 
@@ -65,24 +67,18 @@ def load_config(initial=True):
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         
-        # Функция для получения значения по ключу
         def get_value(key, type_cast):
             cursor.execute("SELECT value, type FROM cfg_discord WHERE key = ? LIMIT 1", (key,))
             row = cursor.fetchone()
             if row:
-                print(f"Чтение {key}: value={row[0]}, type={row[1]}")  # Отладка
-                if row[1] == type_cast.__name__:
+                if row[1] in (type_cast.__name__, "string" if type_cast == str else "integer"):
                     return type_cast(row[0])
-            print(f"Не найдено значение для {key}")  # Отладка
             return None
         
-        # Функция для получения списка по ключу
         def get_list(key, type_cast):
             cursor.execute("SELECT value, type FROM cfg_discord WHERE key = ?", (key,))
             rows = cursor.fetchall()
-            result = [type_cast(row[0]) for row in rows if row[1] == type_cast.__name__]
-            print(f"Чтение списка {key}: {result}")  # Отладка
-            return result
+            return [type_cast(row[0]) for row in rows if row[1] in (type_cast.__name__, "string" if type_cast == str else "integer")]
         
         if initial:
             TG_TOKEN = get_value("TG_TOKEN", str)
@@ -126,6 +122,49 @@ def load_config(initial=True):
             sys.exit(1)
         return False
 
+def save_channel_data(guild):
+    """Сохраняет данные о каналах гильдии в таблицу discord_data"""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    for channel in guild.channels:
+        # Определяем тип канала
+        if isinstance(channel, discord.TextChannel):
+            channel_type = "text"
+        elif isinstance(channel, discord.VoiceChannel):
+            channel_type = "voice"
+        elif isinstance(channel, discord.StageChannel):
+            channel_type = "stage"
+        elif isinstance(channel, discord.CategoryChannel):
+            channel_type = "category"
+        else:
+            channel_type = "unknown"
+        
+        # Получаем родительскую категорию
+        category_id = channel.category.id if channel.category else None
+        category_name = channel.category.name if channel.category else None
+        
+        # Получаем роли, которые могут видеть канал (ID и имена)
+        visible_role_ids = []
+        visible_role_names = []
+        if hasattr(channel, "overwrites"):
+            for target, overwrite in channel.overwrites.items():
+                if isinstance(target, discord.Role) and overwrite.read_messages is True:
+                    visible_role_ids.append(str(target.id))
+                    visible_role_names.append(target.name)
+        visible_to_roles = ",".join(visible_role_ids) if visible_role_ids else None
+        vtr_human = ",".join(visible_role_names) if visible_role_names else None
+        
+        # Сохраняем данные в базу
+        cursor.execute('''INSERT OR REPLACE INTO discord_data 
+                          (channel_id, channel_name, channel_type, category_id, category_name, visible_to_roles, vtr_human)
+                          VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                       (channel.id, channel.name, channel_type, category_id, category_name, visible_to_roles, vtr_human))
+    
+    conn.commit()
+    conn.close()
+    print(f"Данные о каналах гильдии {guild.name} сохранены в базу данных.")
+
 # Инициализируем базу данных и загружаем конфигурацию при запуске
 init_db()
 load_config(initial=True)
@@ -146,14 +185,19 @@ async def reload_config_task():
 async def on_ready():
     print(f"Бот {bot.user.name} подключен к Discord!")
     reload_config_task.start()
+    
     for guild in bot.guilds:
         print(f"\n{guild.name}")
+        # Сохраняем данные о каналах в базу
+        save_channel_data(guild)
+        
         no_category_channels = [c for c in guild.channels if c.category is None and not isinstance(c, discord.CategoryChannel)]
         if no_category_channels:
             print("No category:")
             for channel in no_category_channels:
                 channel_type = "💬" if isinstance(channel, discord.TextChannel) else "🔊" if isinstance(channel, discord.VoiceChannel) else "📢"
                 print(f"    {channel_type} {channel.id} : {channel.name}")
+        
         for category in guild.categories:
             print(f"{category.id} : {category.name}")
             text_channels = [c for c in category.text_channels]
