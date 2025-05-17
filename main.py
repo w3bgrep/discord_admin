@@ -20,6 +20,7 @@ OPEN_TOPIC_ID = None
 DEBUG_CHAT_ID = None
 DEBUG_TOPIC_ID = None
 CODERS = None
+new_channels = []
 
 # Время последней модификации базы данных
 last_db_mtime = 0
@@ -28,12 +29,11 @@ last_db_mtime = 0
 db_path = os.path.join(os.path.dirname(__file__), 'config.db')
 
 def init_db():
-    """Инициализирует базу данных и создаёт таблицы cfg_discord и discord_data"""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
     # Таблица для настроек
-    cursor.execute('''CREATE TABLE IF NOT EXISTS cfg_discord (
+    cursor.execute('''CREATE TABLE IF NOT EXISTS discord_config (
                         key TEXT,
                         value TEXT,
                         type TEXT,
@@ -48,6 +48,12 @@ def init_db():
                         category_name TEXT,
                         visible_to_roles TEXT,
                         vtr_human TEXT)''')
+    
+    cursor.execute('''CREATE TABLE IF NOT EXISTS discord_users (
+                            userid INTEGER PRIMARY KEY,
+                            username TEXT,
+                            roles TEXT,
+                            roles_hr TEXT)''')
     
     conn.commit()
     conn.close()
@@ -68,7 +74,7 @@ def load_config(initial=True):
         cursor = conn.cursor()
         
         def get_value(key, type_cast):
-            cursor.execute("SELECT value, type FROM cfg_discord WHERE key = ? LIMIT 1", (key,))
+            cursor.execute("SELECT value, type FROM discord_config WHERE key = ? LIMIT 1", (key,))
             row = cursor.fetchone()
             if row:
                 if row[1] in (type_cast.__name__, "string" if type_cast == str else "integer"):
@@ -76,7 +82,7 @@ def load_config(initial=True):
             return None
         
         def get_list(key, type_cast):
-            cursor.execute("SELECT value, type FROM cfg_discord WHERE key = ?", (key,))
+            cursor.execute("SELECT value, type FROM discord_config WHERE key = ?", (key,))
             rows = cursor.fetchall()
             return [type_cast(row[0]) for row in rows if row[1] in (type_cast.__name__, "string" if type_cast == str else "integer")]
         
@@ -165,6 +171,103 @@ def save_channel_data(guild):
     conn.close()
     print(f"Данные о каналах гильдии {guild.name} сохранены в базу данных.")
 
+
+def save_user_data(guild):
+    """Сохраняет данные о пользователях гильдии в таблицу discord_users"""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    for member in guild.members:
+        # Получаем ID и имя пользователя
+        user_id = member.id
+        username = member.display_name  # Имя на сервере (ник, если есть, или имя пользователя)
+        
+        # Получаем список ролей (исключаем @everyone, если нужно)
+        role_ids = [str(role.id) for role in member.roles if role != guild.default_role]
+        role_names = [role.name for role in member.roles if role != guild.default_role]
+        roles = ", ".join(role_ids) if role_ids else None
+        roles_hr = ", ".join(role_names) if role_names else None
+        
+        # Сохраняем данные в базу
+        cursor.execute('''INSERT OR REPLACE INTO discord_users 
+                        (userid, username, roles, roles_hr)
+                        VALUES (?, ?, ?, ?)''',
+                    (user_id, username, roles, roles_hr))
+    
+    conn.commit()
+    conn.close()
+    print(f"Данные о пользователях гильдии {guild.name} сохранены в базу данных.")
+
+
+
+async def setup_channel_permissions(channel, creator):
+    try:
+        # Отменяем синхронизацию прав с категорией
+        await channel.edit(sync_permissions=False)
+        print(f"Синхронизация прав отключена для канала {channel.name}")
+
+        # Запрещаем редактирование канала для всех ролей (включая @everyone)
+        for role in channel.guild.roles:
+            await channel.set_permissions(
+                role,
+                manage_channels=False,  # Запрещаем управление каналом
+                manage_permissions=False,  # Запрещаем управление правами
+                manage_webhooks=False,  # Запрещаем управление вебхуками
+                manage_threads=False,  # Запрещаем управление ветками
+                create_instant_invite=False  # Запрещаем создание приглашений
+            )
+            await asyncio.sleep(0.5)
+        # Устанавливаем для @everyone (если нужно сохранить базовые права, например, чтение и отправку сообщений)
+        await channel.set_permissions(
+            channel.guild.default_role,  # @everyone
+            manage_channels=False,
+            manage_permissions=False,
+            manage_webhooks=False,
+            manage_threads=False,
+            create_instant_invite=False,
+            # read_messages=True,  # Разрешить просмотр канала (если нужно)
+            # send_messages=True  # Разрешить отправку сообщений (если нужно)
+        )
+        await asyncio.sleep(0.5)
+        print(f"Запрещены права на редактирование для всех ролей в канале {channel.name}")
+
+        # Выдаём создателю полные права на редактирование и управление видимостью
+        await channel.set_permissions(
+            creator,
+            manage_channels=True,  # Разрешить управление каналом
+            manage_permissions=True,  # Разрешить управление правами
+            manage_webhooks=True,  # Разрешить управление вебхуками
+            manage_threads=True,  # Разрешить управление ветками
+            create_instant_invite=True,  # Разрешить создание приглашений
+            read_messages=True,  # Разрешить просмотр канала
+            send_messages=True  # Разрешить отправку сообщений
+        )
+        await asyncio.sleep(0.5)
+        print(f"Создателю {creator.name} выданы права на редактирование канала {channel.name}")
+
+        # Сохраняем обновлённые данные о канале в базу
+        save_channel_data(channel.guild)
+        print(f"Данные канала {channel.name} сохранены в базу данных")
+
+    except Exception as e:
+        print(f"Ошибка при настройке прав для канала {channel.name}: {str(e)}")
+        # Отправляем ошибку в Telegram для дебаггинга
+        await send_to_telegram(
+            f"Ошибка при настройке прав для канала {channel.name}: {str(e)}",
+            DEBUG_CHAT_ID,
+            DEBUG_TOPIC_ID
+        )
+
+
+
+
+
+
+
+
+
+
+
 # Инициализируем базу данных и загружаем конфигурацию при запуске
 init_db()
 load_config(initial=True)
@@ -190,6 +293,8 @@ async def on_ready():
         print(f"\n{guild.name}")
         # Сохраняем данные о каналах в базу
         save_channel_data(guild)
+
+        save_user_data(guild)
         
         no_category_channels = [c for c in guild.channels if c.category is None and not isinstance(c, discord.CategoryChannel)]
         if no_category_channels:
@@ -218,21 +323,63 @@ async def reload_config_command(ctx):
     else:
         await ctx.send("⚠️ Настройки не были обновлены. Проверьте логи.")
 
+# @bot.event
+# async def on_guild_channel_create(channel):
+#     print(f"Создание канала: {channel.name}")
+#     try:
+#         print(f"Категория канала: {channel.category.id if channel.category else 'нет категории'}")
+#         print(f"Нужная категория: {CODERS}")
+#         print(f"Условие проверки: {channel.category and channel.category.id == CODERS}")
+#     except Exception as e:
+#         print(f"Произошла ошибка: {str(e)}")
+#         print(f"Тип ошибки: {type(e)}")
+
 @bot.event
 async def on_guild_channel_create(channel):
     print(f"Создание канала: {channel.name}")
     try:
-        print(f"Категория канала: {channel.category.id if channel.category else 'нет категории'}")
-        print(f"Нужная категория: {CODERS}")
-        print(f"Условие проверки: {channel.category and channel.category.id == CODERS}")
+        if channel.category and str(channel.category.id) == "1373428861592666223":
+            print(f"Канал {channel.name} создан в целевой категории {channel.category.id}")
+            # Добавляем канал в список новых каналов для ожидания первого сообщения
+            new_channels.append(channel.id)
+            print(f"Канал {channel.id} добавлен в new_channels: {new_channels}")
+            # Сохраняем данные о новом канале в базу
+            save_channel_data(channel.guild)
+        else:
+            print(f"Канал {channel.name} не в целевой категории, пропускаем")
     except Exception as e:
-        print(f"Произошла ошибка: {str(e)}")
-        print(f"Тип ошибки: {type(e)}")
+        print(f"Произошла ошибка в on_guild_channel_create: {str(e)}")
+        await send_to_telegram(
+            f"Ошибка в on_guild_channel_create для канала {channel.name}: {str(e)}",
+            DEBUG_CHAT_ID,
+            DEBUG_TOPIC_ID
+        )
+
+
 
 @bot.event
 async def on_message(message):
     if isinstance(message.channel, discord.Thread):
         return
+    
+    # Проверяем, является ли сообщение первым в новом канале
+    if message.channel.id in new_channels:
+        try:
+            print(f"Получено первое сообщение в новом канале {message.channel.name} от {message.author.name}")
+            # Настраиваем права: отменяем синхронизацию, запрещаем редактирование, выдаём права создателю
+            await setup_channel_permissions(message.channel, message.author)
+            # Удаляем канал из списка новых каналов
+            new_channels.remove(message.channel.id)
+            print(f"Канал {message.channel.id} удалён из new_channels: {new_channels}")
+        except Exception as e:
+            print(f"Ошибка при обработке первого сообщения в канале {message.channel.name}: {str(e)}")
+            await send_to_telegram(
+                f"Ошибка при обработке первого сообщения в канале {message.channel.name}: {str(e)}",
+                DEBUG_CHAT_ID,
+                DEBUG_TOPIC_ID
+            )
+
+
     channel = message.channel
     channel_id = message.channel.id
     category = message.channel.category
