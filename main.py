@@ -1,10 +1,12 @@
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 import aiohttp
 import urllib.parse
 import sqlite3
 import os
 import sys
+import re
 import time
 
 # Глобальные переменные для хранения настроек
@@ -53,7 +55,14 @@ def init_db():
                             userid INTEGER PRIMARY KEY,
                             username TEXT,
                             roles TEXT,
-                            roles_hr TEXT)''')
+                            roles_hr TEXT,
+                            address TEXT)''')  # Добавлена колонка address
+    
+    # Добавляем колонку address, если она еще не существует
+    cursor.execute('''PRAGMA table_info(discord_users)''')
+    columns = [col[1] for col in cursor.fetchall()]
+    if 'address' not in columns:
+        cursor.execute('''ALTER TABLE discord_users ADD COLUMN address TEXT''')
     
     conn.commit()
     conn.close()
@@ -171,7 +180,6 @@ def save_channel_data(guild):
     conn.close()
     print(f"Данные о каналах гильдии {guild.name} сохранены в базу данных.")
 
-
 def save_user_data(guild):
     """Сохраняет данные о пользователях гильдии в таблицу discord_users"""
     conn = sqlite3.connect(db_path)
@@ -180,28 +188,32 @@ def save_user_data(guild):
     for member in guild.members:
         # Получаем ID и имя пользователя
         user_id = member.id
-        username = member.display_name  # Имя на сервере (ник, если есть, или имя пользователя)
+        username = member.display_name
         
-        # Получаем список ролей (исключаем @everyone, если нужно)
+        # Получаем список ролей
         role_ids = [str(role.id) for role in member.roles if role != guild.default_role]
         role_names = [role.name for role in member.roles if role != guild.default_role]
         roles = ", ".join(role_ids) if role_ids else None
         roles_hr = ", ".join(role_names) if role_names else None
         
+        # Проверяем существующий адрес (если есть)
+        cursor.execute("SELECT address FROM discord_users WHERE userid = ?", (user_id,))
+        address = cursor.fetchone()
+        address = address[0] if address else None
+        
         # Сохраняем данные в базу
         cursor.execute('''INSERT OR REPLACE INTO discord_users 
-                        (userid, username, roles, roles_hr)
-                        VALUES (?, ?, ?, ?)''',
-                    (user_id, username, roles, roles_hr))
+                        (userid, username, roles, roles_hr, address)
+                        VALUES (?, ?, ?, ?, ?)''',
+                    (user_id, username, roles, roles_hr, address))
     
     conn.commit()
     conn.close()
     print(f"Данные о пользователях гильдии {guild.name} сохранены в базу данных.")
 
-
-
 async def setup_channel_permissions(channel, creator):
     try:
+        import asyncio
         # Отменяем синхронизацию прав с категорией
         await channel.edit(sync_permissions=False)
         print(f"Синхронизация прав отключена для канала {channel.name}")
@@ -213,7 +225,7 @@ async def setup_channel_permissions(channel, creator):
                 manage_channels=False,  # Запрещаем управление каналом
                 manage_permissions=False,  # Запрещаем управление правами
                 manage_webhooks=False,  # Запрещаем управление вебхуками
-                manage_threads=False,  # Запрещаем управление ветками
+                manage_threads=False,  # Запрещаем управление котами
                 create_instant_invite=False  # Запрещаем создание приглашений
             )
             await asyncio.sleep(0.5)
@@ -237,7 +249,7 @@ async def setup_channel_permissions(channel, creator):
             manage_channels=True,  # Разрешить управление каналом
             manage_permissions=True,  # Разрешить управление правами
             manage_webhooks=True,  # Разрешить управление вебхуками
-            manage_threads=True,  # Разрешить управление ветками
+            manage_threads=True,  # Разрешить управление котами
             create_instant_invite=True,  # Разрешить создание приглашений
             read_messages=True,  # Разрешить просмотр канала
             send_messages=True  # Разрешить отправку сообщений
@@ -258,16 +270,6 @@ async def setup_channel_permissions(channel, creator):
             DEBUG_TOPIC_ID
         )
 
-
-
-
-
-
-
-
-
-
-
 # Инициализируем базу данных и загружаем конфигурацию при запуске
 init_db()
 load_config(initial=True)
@@ -279,6 +281,8 @@ intents.messages = True
 intents.message_content = True
 bot = commands.Bot(command_prefix=">", intents=intents)
 
+# Настройка CommandTree для slash-команд
+
 @tasks.loop(seconds=60)
 async def reload_config_task():
     if load_config(initial=False):
@@ -289,11 +293,17 @@ async def on_ready():
     print(f"Бот {bot.user.name} подключен к Discord!")
     reload_config_task.start()
     
+    # Синхронизация slash-команд
+    try:
+        synced = await bot.tree.sync()
+        print(f"Синхронизировано {len(synced)} slash-команд")
+    except Exception as e:
+        print(f"Ошибка при синхронизации slash-команд: {str(e)}")
+    
     for guild in bot.guilds:
         print(f"\n{guild.name}")
         # Сохраняем данные о каналах в базу
         save_channel_data(guild)
-
         save_user_data(guild)
         
         no_category_channels = [c for c in guild.channels if c.category is None and not isinstance(c, discord.CategoryChannel)]
@@ -323,22 +333,118 @@ async def reload_config_command(ctx):
     else:
         await ctx.send("⚠️ Настройки не были обновлены. Проверьте логи.")
 
-# @bot.event
-# async def on_guild_channel_create(channel):
-#     print(f"Создание канала: {channel.name}")
+# Гибридная команда bind_address (работает и как префиксная, и как слэш)
+# @bot.hybrid_command(name="bind_address", description="Привязать адрес к вашему аккаунту")
+# @app_commands.describe(address="Адрес для привязки к аккаунту")
+# async def bind_address_hybrid(ctx, address: str):
+#     """Команда для привязки адреса к пользователю (гибридная версия)"""
+#     print(f"Гибридная команда bind_address вызвана пользователем {ctx.author.name} с адресом {address}")
+#     user_id = ctx.author.id
+    
 #     try:
-#         print(f"Категория канала: {channel.category.id if channel.category else 'нет категории'}")
-#         print(f"Нужная категория: {CODERS}")
-#         print(f"Условие проверки: {channel.category and channel.category.id == CODERS}")
-#     except Exception as e:
-#         print(f"Произошла ошибка: {str(e)}")
-#         print(f"Тип ошибки: {type(e)}")
+#         conn = sqlite3.connect(db_path)
+#         cursor = conn.cursor()
+        
+#         # Проверяем, не привязан ли адрес к другому пользователю
+#         cursor.execute("SELECT userid, username FROM discord_users WHERE address = ?", (address,))
+#         existing_user = cursor.fetchone()
+        
+#         if existing_user and existing_user[0] != user_id:
+#             await ctx.send(f"❌ Ошибка: Адрес уже привязан к пользователю {existing_user[1]}", ephemeral=True)
+#             conn.close()
+#             return
+        
+#         # Обновляем адрес для текущего пользователя
+#         cursor.execute('''INSERT OR REPLACE INTO discord_users 
+#                         (userid, username, roles, roles_hr, address)
+#                         VALUES (?, ?, ?, ?, ?)''',
+#                       (user_id, 
+#                        ctx.author.display_name,
+#                        ", ".join(str(role.id) for role in ctx.author.roles if role != ctx.guild.default_role) or None,
+#                        ", ".join(role.name for role in ctx.author.roles if role != ctx.guild.default_role) or None,
+#                        address))
+        
+#         conn.commit()
+#         conn.close()
+        
+#         await ctx.send(f"✅ Адрес успешно привязан к вашему аккаунту!", ephemeral=True)
+        
+#     except sqlite3.Error as e:
+#         await ctx.send(f"❌ Ошибка при работе с базой данных: {str(e)}", ephemeral=True)
+#         await send_to_telegram(
+#             f"Ошибка при привязке адреса для {ctx.author.name}: {str(e)}",
+#             DEBUG_CHAT_ID,
+#             DEBUG_TOPIC_ID
+#         )
+
+def is_valid_ethereum_address(address: str) -> bool:
+    """Проверяет, является ли строка валидным Ethereum адресом"""
+    # Проверяем формат: 0x + 40 шестнадцатеричных символов
+    pattern = r'^0x[a-fA-F0-9]{40}$'
+    return bool(re.match(pattern, address))
+
+@bot.hybrid_command(name="bind_address", description="Привязать адрес к вашему аккаунту")
+@app_commands.describe(address="Ethereum адрес для привязки к аккаунту (формат: 0x...)")
+async def bind_address_hybrid(ctx, address: str):
+    """Команда для привязки адреса к пользователю (гибридная версия)"""
+    print(f"Гибридная команда bind_address вызвана пользователем {ctx.author.name} с адресом {address}")
+    user_id = ctx.author.id
+    
+    # Проверяем валидность Ethereum адреса
+    if not is_valid_ethereum_address(address):
+        await ctx.send(
+            "❌ **Ошибка валидации адреса**\n"
+            "Адрес должен быть в формате Ethereum:\n"
+            "`0x` + 40 шестнадцатеричных символов\n"
+            "**Пример:** `0x3DA45eC536031922a1b7FE5DF89630E3E691E66E`", 
+            ephemeral=True
+        )
+        return
+    
+    # Приводим адрес к стандартному формату (lowercase для консистентности)
+    address = address.lower()
+    
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # Проверяем, не привязан ли адрес к другому пользователю
+        cursor.execute("SELECT userid, username FROM discord_users WHERE address = ?", (address,))
+        existing_user = cursor.fetchone()
+        
+        if existing_user and existing_user[0] != user_id:
+            await ctx.send(f"❌ Ошибка: Адрес уже привязан к пользователю {existing_user[1]}", ephemeral=True)
+            conn.close()
+            return
+        
+        # Обновляем адрес для текущего пользователя
+        cursor.execute('''INSERT OR REPLACE INTO discord_users 
+                        (userid, username, roles, roles_hr, address)
+                        VALUES (?, ?, ?, ?, ?)''',
+                      (user_id, 
+                       ctx.author.display_name,
+                       ", ".join(str(role.id) for role in ctx.author.roles if role != ctx.guild.default_role) or None,
+                       ", ".join(role.name for role in ctx.author.roles if role != ctx.guild.default_role) or None,
+                       address))
+        
+        conn.commit()
+        conn.close()
+        
+        await ctx.send(f"✅ **Адрес успешно привязан!**\n`{address}`", ephemeral=True)
+        
+    except sqlite3.Error as e:
+        await ctx.send(f"❌ Ошибка при работе с базой данных: {str(e)}", ephemeral=True)
+        await send_to_telegram(
+            f"Ошибка при привязке адреса для {ctx.author.name}: {str(e)}",
+            DEBUG_CHAT_ID,
+            DEBUG_TOPIC_ID
+        )
 
 @bot.event
 async def on_guild_channel_create(channel):
     print(f"Создание канала: {channel.name}")
     try:
-        if channel.category and str(channel.category.id) == "1373428861592666223":
+        if channel.category and str(channel.category.id) == "1338199154400297023":
             print(f"Канал {channel.name} создан в целевой категории {channel.category.id}")
             # Добавляем канал в список новых каналов для ожидания первого сообщения
             new_channels.append(channel.id)
@@ -355,14 +461,19 @@ async def on_guild_channel_create(channel):
             DEBUG_TOPIC_ID
         )
 
-
-
 @bot.event
 async def on_message(message):
     if isinstance(message.channel, discord.Thread):
         return
+    if message.author.bot:
+        return
     
-    # Проверяем, является ли сообщение первым в новом канале
+    if message.guild is None:
+        await bot.process_commands(message)
+        return    
+    
+
+
     if message.channel.id in new_channels:
         try:
             print(f"Получено первое сообщение в новом канале {message.channel.name} от {message.author.name}")
@@ -378,7 +489,6 @@ async def on_message(message):
                 DEBUG_CHAT_ID,
                 DEBUG_TOPIC_ID
             )
-
 
     channel = message.channel
     channel_id = message.channel.id
@@ -413,4 +523,5 @@ async def send_to_telegram(message_text, chat_id, topic_id):
             response_json = await response.json()
             print(f"Url: {telegram_api_url}")
 
-bot.run(DS_TOKEN)
+if __name__ == "__main__":
+    bot.run(DS_TOKEN)
